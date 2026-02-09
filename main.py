@@ -235,6 +235,11 @@ class TFPScorer:
                 cap_s_q, _ = get_series(bs_q, [self.capital_metric]) 
                 rev_s_q, _ = get_series(inc_q, ['Total Revenue', 'Operating Revenue'])
                 
+                # 重要: 列があっても中身がNaNなら除外する
+                if out_s_q is not None: out_s_q = out_s_q.dropna()
+                if cap_s_q is not None: cap_s_q = cap_s_q.dropna()
+                if rev_s_q is not None: rev_s_q = rev_s_q.dropna()
+                
                 # 最低限のデータチェック (4期分あれば救済ロジックへ)
                 if out_s_q is not None and len(out_s_q) >= 4:
                     
@@ -324,14 +329,17 @@ class TFPScorer:
             #  総合判定 & フラグ
             # ==========================================
             
-            # トレンド判定
-            if valid_q:
+            # Fallback Logic: 四半期データ不足時は年次スコアを代用
+            if not valid_q:
+                self.score_quarter = self.score_annual
+                self.flags_yellow.append("Annual_Only")
+                self.trend_status = "-"
+            else:
+                # トレンド判定
                 diff = self.score_quarter - self.score_annual
                 if diff >= 10: self.trend_status = "改善"
                 elif diff <= -10: self.trend_status = "悪化"
                 else: self.trend_status = "安定"
-            else:
-                self.trend_status = "-"
 
             # フラグ判定 (年次ベース + 最新四半期赤字チェック)
             if not df_a.empty:
