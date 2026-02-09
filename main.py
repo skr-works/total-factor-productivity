@@ -43,29 +43,16 @@ def safe_log(msg, idx=None):
     logger.info(prefix + msg)
 
 # --- 10. HTTP最適化 ---
-def get_session():
-    """リトライ機能付きのセッションを作成"""
-    session = requests.Session()
-    retry = Retry(
-        total=RETRIES,
-        read=RETRIES,
-        connect=RETRIES,
-        backoff_factor=1, # 指数バックオフ
-        status_forcelist=[429, 500, 502, 503, 504],
-    )
-    adapter = HTTPAdapter(max_retries=retry)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
-    # User-Agent設定
-    session.headers.update({"User-Agent": random.choice(USER_AGENTS)})
-    return session
+# yfinanceの仕様変更により外部Session注入は廃止 (内部でcurl_cffi等が使われるため)
+# User-Agent等はyfinanceにお任せする
 
 # --- TFP評価クラス (1銘柄単位のロジック) ---
 class TFPScorer:
     def __init__(self, ticker, idx):
         self.ticker_symbol = ticker
         self.idx = idx
-        self.ticker = yf.Ticker(ticker, session=get_session())
+        # 修正: session引数を削除 (yfinanceの内部処理に任せる)
+        self.ticker = yf.Ticker(ticker)
         
         # 結果保持用
         self.output_metric = "None"
@@ -118,6 +105,8 @@ class TFPScorer:
                 
             except Exception as e:
                 self.reason = "Download Error"
+                # エラーの詳細をログには出すが、処理は継続
+                safe_log(f"yfinance error details: {str(e)[:50]}", self.idx)
                 return self._finalize()
 
             years_count = len(income.columns)
@@ -430,7 +419,6 @@ def main():
     
     # 1. Config読み込み & GSpread認証
     try:
-        # --- 修正箇所: APP_CONFIGから一括読み込み ---
         config_str = os.environ.get('APP_CONFIG')
         if not config_str:
             raise ValueError("APP_CONFIG secret is missing")
@@ -446,7 +434,6 @@ def main():
         creds = ServiceAccountCredentials.from_json_keyfile_dict(gcp_key, scope)
         client = gspread.authorize(creds)
         sheet = client.open_by_url(sheet_url).worksheet(sheet_name)
-        # ------------------------------------------
 
     except Exception as e:
         safe_log(f"Setup Failed: {e}")
