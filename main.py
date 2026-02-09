@@ -85,7 +85,7 @@ class TFPScorer:
         self.val_annual_growth = 0.0
         self.val_quarter_growth = 0.0
         self.val_annual_margin = 0.0
-        self.val_quarter_margin = 0.0
+        self.val_quarter_cp_improv = 0.0 # 変更: 利益率ではなくCP改善幅(pt)
         self.val_quality_gap = 0.0
 
     def _calc_cagr(self, series, n):
@@ -99,14 +99,14 @@ class TFPScorer:
             return 0
 
     def _scoring_logic(self, growth, margin, quality_gap=None):
-        """共通スコアリングロジック (Max 100)"""
+        """共通スコアリングロジック (Max 100) - 年次用"""
         # 1. 成長 (Max 50)
         s1 = 0
         if growth >= 0.06: s1 = 50
         elif growth >= 0.03: s1 = 35
         elif growth >= 0: s1 = 20
         
-        # 2. 利益率水準 (Max 30) - 改善ではなく水準で評価
+        # 2. 利益率水準 (Max 30)
         s2 = 0
         if margin >= 0.10: s2 = 30
         elif margin >= 0.05: s2 = 20
@@ -114,9 +114,8 @@ class TFPScorer:
         
         # 3. 質の加点 (Max 20)
         s3 = 0
-        # quality_gapがNoneの場合は成長率で代替判定（簡易）
         q_val = quality_gap if quality_gap is not None else growth
-        if q_val > 0: s3 = 20 # 資産増より利益増が大きい、または単に成長している
+        if q_val > 0: s3 = 20
         
         return s1 + s2 + s3
 
@@ -227,61 +226,77 @@ class TFPScorer:
                 self.score_annual = 0 # 計算不能
 
             # ==========================================
-            #  B. 四半期TTM評価 (Quarterly Score)
+            #  B. 四半期評価 (YoY Direct Comparison)
             # ==========================================
             valid_q = False
-            if not inc_q.empty and not bs_q.empty:
-                # 科目取得 (年次と同じ科目名を使う)
+            # 5期分のデータが必要 (Current vs 4Q ago)
+            if not inc_q.empty:
                 out_s_q, _ = get_series(inc_q, [self.output_metric])
-                cap_s_q, _ = get_series(bs_q, [self.capital_metric])
+                cap_s_q, _ = get_series(bs_q, [self.capital_metric]) # BSは欠損の可能性あり
                 rev_s_q, _ = get_series(inc_q, ['Total Revenue', 'Operating Revenue'])
                 
-                if out_s_q is not None and cap_s_q is not None:
-                    # TTM化 (直近4四半期合計)
-                    # 少なくとも8四半期はないと、YoY比較ができない
-                    if len(out_s_q) >= 8:
-                        # TTM Output: Rolling sum window 4
-                        ttm_out = out_s_q.rolling(window=4).sum().dropna()
-                        ttm_rev = rev_s_q.rolling(window=4).sum().dropna() if rev_s_q is not None else None
+                # 少なくとも5四半期分ないと前年比較できない
+                if out_s_q is not None and len(out_s_q) >= 5:
+                    
+                    # 1. Output Growth (YoY) - 40点
+                    curr_out = out_s_q.iloc[-1]
+                    prior_out = out_s_q.iloc[-5] # 1年前
+                    
+                    growth_q = 0.0
+                    if prior_out > 0:
+                        growth_q = (curr_out / prior_out) - 1
+                    
+                    s_q1 = 0
+                    if growth_q >= 0.10: s_q1 = 40
+                    elif growth_q >= 0.05: s_q1 = 25
+                    elif growth_q >= 0.00: s_q1 = 10
+                    # マイナスは0点
+                    
+                    # 2. Capital Productivity Improvement (YoY) - 40点
+                    cp_improv = 0.0
+                    s_q2 = 0
+                    
+                    # 資本データが5期分ある場合のみ計算
+                    if cap_s_q is not None and len(cap_s_q) >= 5:
+                        curr_cap = cap_s_q.iloc[-1]
+                        prior_cap = cap_s_q.iloc[-5]
                         
-                        # TTM Capital: (Current + 4Q_Ago) / 2  (季節調整)
-                        # shift(4) は4つ前のデータ
-                        cap_prev_year = cap_s_q.shift(4)
-                        ttm_cap = (cap_s_q + cap_prev_year) / 2
-                        ttm_cap = ttm_cap.dropna()
+                        # 0除算回避
+                        curr_cp = curr_out / curr_cap if curr_cap != 0 else 0
+                        prior_cp = prior_out / prior_cap if prior_cap != 0 else 0
                         
-                        # 共通インデックスで結合
-                        df_q = pd.DataFrame({'Output': ttm_out}).join(ttm_cap.rename('Capital'), how='inner')
-                        if ttm_rev is not None:
-                            df_q = df_q.join(ttm_rev.rename('Revenue'), how='inner')
+                        cp_improv = curr_cp - prior_cp
                         
-                        if len(df_q) >= 2: # 最低でも CurrentとPrior の2点が必要
-                            # 指標計算
-                            df_q['CP'] = df_q['Output'] / df_q['Capital']
-                            df_q['Margin'] = df_q['Output'] / df_q['Revenue'] if 'Revenue' in df_q.columns else 0
+                        if cp_improv >= 0.1: s_q2 = 40
+                        elif cp_improv > -0.1: s_q2 = 20 # 横ばい/微減は安定評価
+                        else: s_q2 = 0 # 悪化
+                    else:
+                        # 資本データ不足時は中立(20点)とするか0点か。ここでは保守的に0点
+                        s_q2 = 0
+                    
+                    # 3. Margin Trend (vs Avg 4 quarters) - 20点
+                    s_q3 = 0
+                    if rev_s_q is not None and len(rev_s_q) >= 4:
+                        # 直近4期のマージンを計算
+                        # iloc[-1] ... iloc[-4]
+                        margins = []
+                        for i in range(1, 5):
+                             if i > len(out_s_q): break
+                             o = out_s_q.iloc[-i]
+                             r = rev_s_q.iloc[-i]
+                             if r != 0: margins.append(o/r)
+                        
+                        if len(margins) == 4:
+                            curr_marg = margins[0] # 最新
+                            avg_marg = sum(margins) / 4
                             
-                            # 直近TTM vs 1年前TTM (4期前)
-                            # df_qはすでにTTM化されている時系列。
-                            # indexは四半期末。df_q.iloc[-1]が最新TTM、iloc[-5]が前年同期TTM
-                            # しかしdf_qは四半期ごとのスライドデータなので、iloc[-1]とiloc[-5]でYoYになる
-                            
-                            if len(df_q) >= 5:
-                                curr = df_q.iloc[-1]
-                                prior = df_q.iloc[-5] # 1年前のTTM
-                                
-                                # CP Growth (YoY)
-                                if prior['CP'] > 0:
-                                    growth_q = (curr['CP'] / prior['CP']) - 1
-                                else:
-                                    growth_q = 0
-                                
-                                margin_q = curr['Margin']
-                                
-                                self.val_quarter_growth = growth_q
-                                self.val_quarter_margin = margin_q
-                                
-                                self.score_quarter = self._scoring_logic(growth_q, margin_q, None) # Gapは省略
-                                valid_q = True
+                            if curr_marg > avg_marg: s_q3 = 20
+                    
+                    # 合計スコア
+                    self.score_quarter = s_q1 + s_q2 + s_q3
+                    self.val_quarter_growth = growth_q
+                    self.val_quarter_cp_improv = cp_improv
+                    valid_q = True
 
             # ==========================================
             #  総合判定 & フラグ
@@ -301,8 +316,8 @@ class TFPScorer:
                 if df_a['Output'].iloc[-1] < 0: self.flags_red.append("Annual_Deficit")
             
             # 四半期直近赤字
-            if valid_q and df_q['Output'].iloc[-1] < 0:
-                self.flags_red.append("TTM_Deficit")
+            if valid_q and out_s_q.iloc[-1] < 0:
+                self.flags_red.append("Q_Deficit")
             
             if self.output_metric == 'Total Revenue':
                 self.flags_yellow.append("RevBase")
@@ -349,7 +364,7 @@ class TFPScorer:
     def _finalize(self):
         # A~B列は呼び出し元で管理。C列以降を返す
         # 列順: C:判定, D:年次Sc, E:四半期Sc, F:トレンド, G:品質, H:フラグ, I:理由, 
-        # J:期末, K:Output, L:Capital, M:年次成長, N:四半期成長, O:年次利益率, P:四半期利益率, Q:質
+        # J:期末, K:Output, L:Capital, M:年次成長, N:四半期成長, O:年次利益率, P:四半期効率改善, Q:質
         
         y_str = ",".join(self.flags_yellow)
         r_str = ",".join(self.flags_red)
@@ -369,7 +384,7 @@ class TFPScorer:
             round(self.val_annual_growth * 100, 2),  # M (%)
             round(self.val_quarter_growth * 100, 2), # N (%)
             round(self.val_annual_margin * 100, 2),  # O (%)
-            round(self.val_quarter_margin * 100, 2), # P (%)
+            round(self.val_quarter_cp_improv, 4),    # P (pt)
             round(self.val_quality_gap * 100, 2)     # Q (pt)
         ]
 
