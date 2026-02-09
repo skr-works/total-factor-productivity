@@ -2,31 +2,29 @@ name: TFP Proxy Analysis
 
 on:
   schedule:
-    # JST 金曜 19:02 は UTC 金曜 10:02 です
+    # JST Friday 19:02 -> UTC Friday 10:02
     - cron: '2 10 * * 5'
-  workflow_dispatch: # 手動実行ボタンも有効化
+  workflow_dispatch:
 
 jobs:
   analyze_stocks:
     runs-on: ubuntu-latest
-    
     steps:
-      - name: リポジトリのチェックアウト
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Pythonのセットアップ
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: ライブラリのインストール
+      - name: Install Dependencies
         run: |
-          pip install pandas yfinance gspread oauth2client numpy
+          pip install -r requirements.txt
 
-      - name: 分析スクリプトの実行
+      - name: Run TFP Analysis
         env:
-          # Secretsから情報を読み込みます
           GCP_KEYS_JSON: ${{ secrets.GCP_KEYS_JSON }}
           SPREADSHEET_URL: ${{ secrets.SPREADSHEET_URL }}
           SHEET_NAME: ${{ secrets.SHEET_NAME }}
-        run: python tfp_scan.py
+        run: python main.py
