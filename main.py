@@ -226,73 +226,95 @@ class TFPScorer:
                 self.score_annual = 0 # 計算不能
 
             # ==========================================
-            #  B. 四半期評価 (YoY Direct Comparison)
+            #  B. 四半期評価 (ハイブリッド対応版)
             # ==========================================
             valid_q = False
-            # 5期分のデータが必要 (Current vs 4Q ago)
+            
             if not inc_q.empty:
                 out_s_q, _ = get_series(inc_q, [self.output_metric])
-                cap_s_q, _ = get_series(bs_q, [self.capital_metric]) # BSは欠損の可能性あり
+                cap_s_q, _ = get_series(bs_q, [self.capital_metric]) 
                 rev_s_q, _ = get_series(inc_q, ['Total Revenue', 'Operating Revenue'])
                 
-                # 少なくとも5四半期分ないと前年比較できない
-                if out_s_q is not None and len(out_s_q) >= 5:
-                    
-                    # 1. Output Growth (YoY) - 40点
-                    curr_out = out_s_q.iloc[-1]
-                    prior_out = out_s_q.iloc[-5] # 1年前
+                # 最低限のデータチェック (4期分あれば救済ロジックへ)
+                if out_s_q is not None and len(out_s_q) >= 4:
                     
                     growth_q = 0.0
-                    if prior_out > 0:
-                        growth_q = (curr_out / prior_out) - 1
+                    cp_improv = 0.0
                     
                     s_q1 = 0
+                    s_q2 = 0
+                    s_q3 = 0
+
+                    # ----------------------------------------------------
+                    # パターン1: 5期分ある (前年同期比 YoY が計算可能)
+                    # ----------------------------------------------------
+                    if len(out_s_q) >= 5:
+                        curr_out = out_s_q.iloc[-1]
+                        prior_out = out_s_q.iloc[-5] # 1年前
+                        
+                        # 1. Output Growth (YoY)
+                        if prior_out > 0:
+                            growth_q = (curr_out / prior_out) - 1
+                        
+                        # 2. CP Improvement (YoY)
+                        if cap_s_q is not None and len(cap_s_q) >= 5:
+                            curr_cap = cap_s_q.iloc[-1]
+                            prior_cap = cap_s_q.iloc[-5]
+                            curr_cp = curr_out / curr_cap if curr_cap != 0 else 0
+                            prior_cp = prior_out / prior_cap if prior_cap != 0 else 0
+                            cp_improv = curr_cp - prior_cp
+                        else:
+                            # 資本不足時はOutput成長だけで簡易判定して加点
+                            cp_improv = growth_q * 0.1 # 擬似値
+                    
+                    # ----------------------------------------------------
+                    # パターン2: 4期分しかない (直近Q vs 前Q QoQ で代用評価)
+                    # ----------------------------------------------------
+                    else: 
+                        curr_out = out_s_q.iloc[-1]
+                        prior_out = out_s_q.iloc[-2] # 1つ前の四半期 (QoQ)
+                        
+                        # 1. Output Growth (QoQ -> Annualize換算で評価)
+                        if prior_out > 0:
+                            q_growth = (curr_out / prior_out) - 1
+                            # QoQなので基準を少し甘くするか、そのまま勢いとして見る
+                            growth_q = q_growth 
+                        
+                        # 2. CP Improvement (QoQ)
+                        if cap_s_q is not None and len(cap_s_q) >= 2:
+                            curr_cap = cap_s_q.iloc[-1]
+                            prior_cap = cap_s_q.iloc[-2]
+                            curr_cp = curr_out / curr_cap if curr_cap != 0 else 0
+                            prior_cp = prior_out / prior_cap if prior_cap != 0 else 0
+                            cp_improv = curr_cp - prior_cp
+                    
+                    # --- 採点 (共通基準) ---
+                    
+                    # 1. Growth (Max 40)
                     if growth_q >= 0.10: s_q1 = 40
                     elif growth_q >= 0.05: s_q1 = 25
                     elif growth_q >= 0.00: s_q1 = 10
-                    # マイナスは0点
                     
-                    # 2. Capital Productivity Improvement (YoY) - 40点
-                    cp_improv = 0.0
-                    s_q2 = 0
+                    # 2. CP Improv (Max 40)
+                    if cp_improv >= 0.1: s_q2 = 40
+                    elif cp_improv > -0.05: s_q2 = 20 # 基準を少し緩和
+                    else: s_q2 = 0
                     
-                    # 資本データが5期分ある場合のみ計算
-                    if cap_s_q is not None and len(cap_s_q) >= 5:
-                        curr_cap = cap_s_q.iloc[-1]
-                        prior_cap = cap_s_q.iloc[-5]
-                        
-                        # 0除算回避
-                        curr_cp = curr_out / curr_cap if curr_cap != 0 else 0
-                        prior_cp = prior_out / prior_cap if prior_cap != 0 else 0
-                        
-                        cp_improv = curr_cp - prior_cp
-                        
-                        if cp_improv >= 0.1: s_q2 = 40
-                        elif cp_improv > -0.1: s_q2 = 20 # 横ばい/微減は安定評価
-                        else: s_q2 = 0 # 悪化
-                    else:
-                        # 資本データ不足時は中立(20点)とするか0点か。ここでは保守的に0点
-                        s_q2 = 0
-                    
-                    # 3. Margin Trend (vs Avg 4 quarters) - 20点
-                    s_q3 = 0
+                    # 3. Margin Trend (Max 20)
                     if rev_s_q is not None and len(rev_s_q) >= 4:
-                        # 直近4期のマージンを計算
-                        # iloc[-1] ... iloc[-4]
                         margins = []
-                        for i in range(1, 5):
-                             if i > len(out_s_q): break
+                        # 取得できる全期間(最大4)で平均比較
+                        loop_len = min(len(out_s_q), 4)
+                        for i in range(1, loop_len + 1):
                              o = out_s_q.iloc[-i]
                              r = rev_s_q.iloc[-i]
                              if r != 0: margins.append(o/r)
                         
-                        if len(margins) == 4:
-                            curr_marg = margins[0] # 最新
-                            avg_marg = sum(margins) / 4
-                            
+                        if len(margins) >= 1:
+                            curr_marg = margins[0]
+                            avg_marg = sum(margins) / len(margins)
                             if curr_marg > avg_marg: s_q3 = 20
                     
-                    # 合計スコア
                     self.score_quarter = s_q1 + s_q2 + s_q3
                     self.val_quarter_growth = growth_q
                     self.val_quarter_cp_improv = cp_improv
