@@ -24,7 +24,6 @@ jobs:
 
       - name: Run TFP Analysis
         env:
-          GCP_KEYS_JSON: ${{ secrets.GCP_KEYS_JSON }}
-          SPREADSHEET_URL: ${{ secrets.SPREADSHEET_URL }}
-          SHEET_NAME: ${{ secrets.SHEET_NAME }}
+          # すべての設定をまとめたJSONを渡す
+          APP_CONFIG: ${{ secrets.TFP_APP_CONFIG }}
         run: python main.py
