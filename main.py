@@ -59,12 +59,12 @@ def get_session():
     session.headers.update({"User-Agent": random.choice(USER_AGENTS)})
     return session
 
-# --- TFP評価クラス (ハイブリッド評価ロジック) ---
+# --- TFP評価クラス (ハイブリッド評価ロジック・厳格版) ---
 class TFPScorer:
     def __init__(self, ticker, idx):
         self.ticker_symbol = ticker
         self.idx = idx
-        self.ticker = yf.Ticker(ticker) 
+        self.ticker = yf.Ticker(ticker)
         
         # 結果保持用
         self.final_grade = "D"
@@ -99,23 +99,20 @@ class TFPScorer:
 
     def _new_scoring_logic(self, spread, last_margin, avg_margin, consistency_count):
         """
-        新・評価基準 (合計100点)
-        1. Efficiency Spread (50点): 資産増と利益増のギャップ
-        2. Margin Power (30点): 利益率の水準と改善
-        3. Consistency (20点): 成長の安定感
+        新・評価基準 (合計100点) - 厳格モード
         """
-        # 1. Efficiency Spread (50点)
+        # 1. Efficiency Spread (50点): 基準引き上げ
         s1 = 0
-        if spread >= 0.05: s1 = 50
-        elif spread >= 0.01: s1 = 35
-        elif spread >= -0.02: s1 = 20
-        else: s1 = 0 # 資産膨張過多
+        if spread >= 0.08: s1 = 50      # +8%以上 (超高効率)
+        elif spread >= 0.04: s1 = 30    # +4%以上 (優良)
+        elif spread > 0: s1 = 10        # プラス圏 (維持)
+        else: s1 = 0                    # マイナス (資産膨張)
         
-        # 2. Margin Power (30点)
+        # 2. Margin Power (30点): 絶対水準重視
         s2_base = 0
-        if last_margin >= 0.10: s2_base = 15
-        elif last_margin >= 0.05: s2_base = 10
-        elif last_margin > 0: s2_base = 5
+        if last_margin >= 0.15: s2_base = 15    # 15%以上
+        elif last_margin >= 0.08: s2_base = 8   # 8%以上
+        elif last_margin > 0: s2_base = 2       # 黒字
         
         s2_improv = 0
         if last_margin >= avg_margin + 0.01: s2_improv = 15 # 1pt改善
@@ -140,18 +137,18 @@ class TFPScorer:
             try:
                 inc_a = self.ticker.income_stmt
                 bs_a = self.ticker.balance_sheet
-                inc_q = self.ticker.quarterly_income_stmt # 確認用のみに使用
+                inc_q = self.ticker.quarterly_income_stmt # 確認用
                 
                 if inc_a.empty or bs_a.empty:
                     self.reason = "No Annual Data"
                     return self._finalize()
                 
-                # 並べ替え (過去 -> 未来)
+                # 並べ替え
                 inc_a = inc_a.sort_index(axis=1)
                 bs_a = bs_a.sort_index(axis=1)
                 if not inc_q.empty: inc_q = inc_q.sort_index(axis=1)
 
-                self.asof = str(inc_a.columns[-1].date()) # 年次ベースの日付を採用
+                self.asof = str(inc_a.columns[-1].date())
 
             except Exception as e:
                 self.reason = "Download Error"
@@ -176,17 +173,17 @@ class TFPScorer:
 
             # --- 3. データ品質スコア ---
             years = len(inc_a.columns)
-            q1 = 40 if years >= 5 else (25 if years == 4 else (10 if years == 3 else 0))
+            q1 = 40 if years >= 5 else (25 if years == 4 else 0)
             
             q2 = 0
             if out_name in ['EBITDA', 'Operating Income']: q2 = 30
             elif out_name == 'Gross Profit': q2 = 15
-            elif out_name == 'Total Revenue': q2 = 0 # 売上ベースは厳しい
+            elif out_name == 'Total Revenue': q2 = 0
             
             q3 = 30 if cap_name == 'Total Assets' else 0
             self.data_quality_score = q1 + q2 + q3
 
-            if self.data_quality_score < 40: # 足切り
+            if self.data_quality_score < 40:
                 self.reason = "Quality<40"
                 return self._finalize()
 
@@ -195,7 +192,6 @@ class TFPScorer:
             # ==========================================
             df = pd.DataFrame({'Output': out_s_a}).dropna()
             
-            # 資本平均化
             if cap_s_a is not None:
                 prev = cap_s_a.shift(1)
                 avg_cap = (cap_s_a + prev) / 2
@@ -213,12 +209,12 @@ class TFPScorer:
             # 指標計算
             df['Margin'] = df['Output'] / df['Revenue'] if 'Revenue' in df.columns else 0
             
-            # CAGR計算 (5年優先)
+            # CAGR計算
             n = 5 if len(df) >= 5 else len(df)
             cagr_out = self._calc_cagr(df['Output'], n) or 0
             cagr_cap = self._calc_cagr(df['Capital'], n) or 0
             
-            # 指標1: Efficiency Spread
+            # 指標1: Efficiency Spread (最重要)
             spread = cagr_out - cagr_cap
             self.efficiency_spread = spread
             
@@ -229,7 +225,7 @@ class TFPScorer:
             elif last_margin <= avg_margin - 0.005: self.val_margin_trend = "悪化"
             else: self.val_margin_trend = "維持"
             
-            # 指標3: Consistency (増益回数)
+            # 指標3: Consistency
             pct_chg = df['Output'].pct_change().dropna()
             consistency = (pct_chg >= 0).sum()
             self.val_consistency_count = consistency
@@ -237,7 +233,7 @@ class TFPScorer:
             # スコア算出
             self.total_score = self._new_scoring_logic(spread, last_margin, avg_margin, consistency)
             
-            # --- 直近四半期の確認 (参考情報) ---
+            # --- 直近四半期の確認 (参考情報・フラグ用) ---
             has_quarterly = False
             q_status = "-"
             
@@ -246,10 +242,9 @@ class TFPScorer:
                 if q_out is not None:
                     q_out = q_out.dropna()
                     if len(q_out) >= 1:
-                        # 単にデータがあるか、直近赤字じゃないか等を確認
                         last_q_val = q_out.iloc[-1]
                         if last_q_val < 0: q_status = "赤字"
-                        elif len(q_out) >= 5: # YoYが見れるなら見る
+                        elif len(q_out) >= 5: # YoY
                             prior_q = q_out.iloc[-5]
                             if prior_q > 0 and last_q_val > prior_q: q_status = "増益"
                             elif prior_q > 0: q_status = "減益"
@@ -264,56 +259,53 @@ class TFPScorer:
 
             # --- 警告フラグ ---
             if df['Output'].iloc[-1] < 0: self.flags_red.append("Deficit")
-            if self.output_metric == 'Total Revenue': self.flags_red.append("RevBase") # AA除外用
+            if self.output_metric == 'Total Revenue': self.flags_red.append("RevBase")
             
             # ==========================================
-            #  総合判定 (グレーディング)
+            #  総合判定 (グレーディング・キャップ制)
             # ==========================================
             grade = "D"
             reasons = []
             
-            # ベース判定
+            # 1. ベース判定
             score = self.total_score
             if score >= 85: grade = "AA"
             elif score >= 70: grade = "A"
             elif score >= 50: grade = "B"
-            else: grade = "C" # スコアが低ければC
+            else: grade = "C"
             
-            # 強制降格ルール (Overconfidence Blocker)
+            # 2. 強制キャップ (上限規制)
             
-            # 1. 致命的欠陥 (D落ち)
-            if self.data_quality_score < 40 or df['Output'].iloc[-1] < 0:
-                grade = "D"
-                reasons.append("Fatal_Defect")
+            # [Cap: B] Revenueベースは信用しない
+            if self.output_metric == 'Total Revenue':
+                if grade in ["AA", "A"]:
+                    grade = "B"
+                    reasons.append("Cap:RevBase")
             
-            # 2. 効率悪化 (C落ち)
-            elif spread < -0.05: # 資産だけ5%以上余計に増えている
-                grade = "C"
-                reasons.append("Spread_Collapse")
+            # [Cap: B] 資産効率が悪化しているなら高評価しない
+            if spread <= 0:
+                if grade in ["AA", "A"]:
+                    grade = "B"
+                    reasons.append("Cap:BadSpread")
             
-            # 3. AA/Aの条件チェック
-            elif grade in ["AA", "A"]:
-                # AA要件
+            # [Cap: A] Annual OnlyはAA不可
+            if not has_quarterly:
                 if grade == "AA":
-                    if self.output_metric == 'Total Revenue': # 売上ベースはAA不可
-                        grade = "A"
-                        reasons.append("No_AA_RevBase")
-                    if len(self.flags_red) > 0:
-                        grade = "A"
-                
-                # A要件 (もしRedがあればBへ)
-                if grade == "A":
-                    if len(self.flags_red) > 0:
-                        grade = "B"
-                        reasons.append("RedFlag")
+                    grade = "A"
+                    reasons.append("Cap:AnnualOnly")
+
+            # 3. 降格 (Red Flag)
+            if len(self.flags_red) > 0:
+                grade = "D" # 赤字等はDまで落とす
+                reasons.append("RedFlag")
 
             self.final_grade = grade
             self.reason = "; ".join(reasons)
             
-            # 表示用数値保存
+            # 数値保存
             self.val_out_cagr = cagr_out
             self.val_cap_cagr = cagr_cap
-            self.val_annual_margin = avg_margin # 過去平均を表示
+            self.val_annual_margin = avg_margin
 
         except Exception as e:
             self.reason = f"Err: {str(e)[:30]}"
@@ -323,8 +315,7 @@ class TFPScorer:
         return self._finalize()
 
     def _finalize(self):
-        # A~B列は呼び出し元で管理。C列以降を返す
-        # 列順: C:判定, D:総合Sc, E:スプレッド, F:四半期状況, G:品質, H:フラグ, I:理由, 
+        # 列定義: C:判定, D:総合Sc, E:スプレッド, F:四半期状況, G:品質, H:フラグ, I:理由, 
         # J:期末, K:Output, L:Capital, M:Output成長, N:Capital成長, O:利益率トレンド, P:安定回数, Q:(空き)
         
         y_str = ",".join(self.flags_yellow)
@@ -358,7 +349,6 @@ def process_batch(batch_data, start_idx):
         for i, row in enumerate(batch_data):
             code = str(row[0]).strip()
             if not code:
-                # 空行はスキップ結果を入れる (15列: C~Q)
                 results.append([""] * 15) 
                 continue
 
@@ -374,7 +364,6 @@ def process_batch(batch_data, start_idx):
             try:
                 batch_results[local_i] = future.result()
             except:
-                # エラー時は空の結果を埋める (15列)
                 batch_results[local_i] = ["E"] + ["-"] * 14
         
     return batch_results
