@@ -20,7 +20,7 @@ from oauth2client.service_account import ServiceAccountCredentials
 WORKERS = 4
 BATCH_SIZE = 50
 JITTER_MIN = 0.5
-JITTER_MAX = 2.0  # yfinanceへの負荷を考慮して少し長めに設定
+JITTER_MAX = 2.0
 RETRIES = 3
 TIMEOUT = 20
 
@@ -428,18 +428,28 @@ def process_batch(batch_data, start_idx):
 def main():
     safe_log("Script started.")
     
-    # 1. GSpread認証
+    # 1. Config読み込み & GSpread認証
     try:
-        scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-        json_key = json.loads(os.environ['GCP_KEYS_JSON'])
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(json_key, scope)
-        client = gspread.authorize(creds)
+        # --- 修正箇所: APP_CONFIGから一括読み込み ---
+        config_str = os.environ.get('APP_CONFIG')
+        if not config_str:
+            raise ValueError("APP_CONFIG secret is missing")
         
-        sheet_url = os.environ['SPREADSHEET_URL']
-        sheet_name = os.environ['SHEET_NAME']
+        config = json.loads(config_str)
+        
+        # JSONから必要なパラメータを展開
+        gcp_key = config['gcp_key']
+        sheet_url = config['spreadsheet_url']
+        sheet_name = config['sheet_name']
+
+        scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(gcp_key, scope)
+        client = gspread.authorize(creds)
         sheet = client.open_by_url(sheet_url).worksheet(sheet_name)
+        # ------------------------------------------
+
     except Exception as e:
-        safe_log(f"Auth Failed: {e}")
+        safe_log(f"Setup Failed: {e}")
         return
 
     # 2. データ読み込み
